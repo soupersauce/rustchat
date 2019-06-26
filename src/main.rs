@@ -2,16 +2,22 @@ extern crate mio;
 extern crate http_muncher;
 extern crate sha1;
 extern crate rustc_serialize;
+extern crate byteorder;
 
-use mio::*;
-use mio::tcp::*;
 use std::net::SocketAddr;
 use std::collections::HashMap;
-use rustc_serialize::base64::{ToBase64, STANDARD};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::fmt;
+
+use mio::*;
+use mio::tcp::*;
+use rustc_serialize::base64::{ToBase64, STANDARD};
 use http_muncher::{Parser, ParserHandler};
+
+mod frame;
+
+use frame::{WebSocketFrame, OpCode};
 
 const SERVER_TOKEN: Token = Token(0);
 
@@ -29,11 +35,10 @@ fn gen_key(key: &String) -> String {
 
 #[derive(PartialEq)]
 enum ClientState {
-    AwaitingHandshake,
+    AwaitingHandshake(RefCell<Parser<HttpParser>>),
     HandshakeResponse,
     Connected,
 }
-
 struct WebSocketServer {
     socket: TcpListener,
     clients: HashMap<Token, WebSocketClient>,
@@ -118,9 +123,6 @@ impl ParserHandler for HttpParser {
 
 struct WebSocketClient {
     socket: TcpStream,
-    http_parser: Parser<HttpParser>,
-
-    // Adding headers declaration to WebSocketClient struct
     headers: Rc<RefCell<HashMap<String, String>>>,
 
     interest: EventSet,
@@ -152,30 +154,34 @@ impl WebSocketClient {
         self.interest.insert(EventSet::readable());
     }
 
-    fn read(&mut self) {
+    fn read_handshake(&mut self) {
         loop {
             let mut buf = [0; 2048];
+            let is_upgrade = if let ClientState::AwaitingHandshake(ref parser_state) = self.state {
+                let mut parser = parser_state.borrow_mut();
+                parser.parse(&buf);
+                parser.is_upgrade()
+            } else { false };
 
-            match self.socket.try_read(&mut buf) {
-                Err(e) => {
-                    println!("Error while reading socket: {:?}", e);
-                    return
-                },
-                Ok(None) =>
-                    // Socket buffer has got no more bytes.
-                    break,
-                Ok(Some(len)) => {
-                    self.http_parser.parse(&buf);
-                    if self.http_parser.is_upgrade() {
-                        // Change the current state
-                        self.state = ClientState::HandshakeResponse;
+            if is_upgrade {
+                // Change the current state
+                self.state = ClientState::HandshakeResponse;
+                self.interest.remove(EventSet::readable());
+                self.interest.remove(EventSet::writable());
+            }
+        }    
+    }
 
-                        // Change current interest to 'Writable'
-                        self.interest.remove(EventSet::readable());
-                        self.interest.insert(EventSet::writable());
-
-                        break;
-                    }
+    fn read(&mut self) {
+        match self.state {
+            ClientState::AwaitingHandshake(_) => {
+                self.read_handshake();
+            },
+            ClientState::Connected => {
+                let frame = WebSocketFrame::read(&mut self.socket);
+                match frame {
+                    Ok(frame) => println!("{:?}", frame),
+                    Err(e)  => println!("error while reading frame: {}", e),
                 }
             }
         }
@@ -191,16 +197,12 @@ impl WebSocketClient {
             // to read its contents
             headers: headers.clone(),
 
-            http_parser: Parser::request(HttpParser {
-                current_key: None,
-
-                // and the second clone to write new headers to:
-                headers: headers.clone(),
-            }),
-
             interest: EventSet::readable(),
 
-            state: ClientState::AwaitingHandshake,
+            state: ClientState::AwaitingHandshake(RefCell::new(Parser::request(HttpParser {
+                current_key: None,
+                headers: headers.clone()
+            }))),
         }
     }
 }
